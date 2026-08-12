@@ -8206,6 +8206,20 @@ function konvo_run_reply(array $cfg): void
             $topicOpRaw
         );
         if (trim($safeReplyText) === '') {
+            // If the model is unreachable rather than just unhelpful, stay quiet.
+            // The canned lines read as non-sequiturs against a real post: a
+            // sarcastic guess at a challenge once drew "Fair question." back.
+            if (function_exists('konvo_anthropic_unavailable') && konvo_anthropic_unavailable()) {
+                $lastFailure = function_exists('konvo_anthropic_last_failure') ? konvo_anthropic_last_failure() : array();
+                konvo_json_out(array(
+                    'ok' => true,
+                    'posted' => false,
+                    'reason' => 'model_unavailable',
+                    'detail' => (string)($lastFailure['error'] ?? ''),
+                    'status' => (int)($lastFailure['status'] ?? 0),
+                    'hint' => 'Skipped rather than posting a canned reply.',
+                ));
+            }
             $safeReplyText = konvo_emergency_safe_reply_text($title, $lastRaw, $topicOpRaw);
         }
         if ($previewOnly) {

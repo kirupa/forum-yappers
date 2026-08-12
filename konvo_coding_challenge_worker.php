@@ -415,6 +415,22 @@ $nextNumber = max(1, $lastNumber + 1);
 $bot = cc_pick_bot($bots);
 $challenge = cc_pick_challenge($state);
 
+// Posting a canned challenge while the API is down produces repeats (the
+// fallback pool is only four items) and burns a challenge number for content
+// nobody wrote. Stay quiet instead and let the next cron slot try again.
+if ((string)($challenge['_origin'] ?? '') === 'fallback'
+    && function_exists('konvo_anthropic_unavailable') && konvo_anthropic_unavailable()) {
+    $lastFailure = function_exists('konvo_anthropic_last_failure') ? konvo_anthropic_last_failure() : array();
+    cc_out(200, array(
+        'ok' => true,
+        'posted' => false,
+        'reason' => 'model_unavailable',
+        'detail' => (string)($lastFailure['error'] ?? ''),
+        'status' => (int)($lastFailure['status'] ?? 0),
+        'hint' => 'Skipped rather than posting a canned challenge. Will retry on the next scheduled run.',
+    ));
+}
+
 $summary = cc_clean_title_summary((string)($challenge['title_summary'] ?? ''));
 $title = 'Coding Challenge - #' . $nextNumber . ($summary !== '' ? (': ' . $summary) : '');
 $raw = cc_build_raw($challenge);

@@ -901,6 +901,21 @@ $botSignature = function_exists('konvo_signature_with_optional_emoji')
         ? konvo_signature_base_name((string)($bot['name'] ?? 'BayMax'))
         : (string)($bot['name'] ?? 'BayMax'));
 $case = spot_pick_case($state);
+
+// Same reasoning as the coding challenge worker: a canned bug while the API is
+// down means repeats, so skip the slot instead.
+if ((string)($case['_origin'] ?? '') === 'fallback'
+    && function_exists('konvo_anthropic_unavailable') && konvo_anthropic_unavailable()) {
+    $lastFailure = function_exists('konvo_anthropic_last_failure') ? konvo_anthropic_last_failure() : array();
+    spot_out(200, array(
+        'ok' => true,
+        'posted' => false,
+        'reason' => 'model_unavailable',
+        'detail' => (string)($lastFailure['error'] ?? ''),
+        'status' => (int)($lastFailure['status'] ?? 0),
+        'hint' => 'Skipped rather than posting a canned challenge. Will retry on the next scheduled run.',
+    ));
+}
 $raw = spot_build_raw($case, $botSignature);
 $titleSummary = spot_derive_title_summary($case);
 $title = $titleSummary !== '' ? $titleBase . ': ' . $titleSummary : $titleBase;

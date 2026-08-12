@@ -6,6 +6,36 @@ if (!defined('KONVO_ANTHROPIC_API_KEY')) {
     define('KONVO_ANTHROPIC_API_KEY', trim((string)getenv('ANTHROPIC_API_KEY')));
 }
 
+/**
+ * Records the outcome of the most recent API call so workers can tell an
+ * unavailable API apart from a merely unusable answer, and skip posting rather
+ * than falling back to canned content.
+ */
+if (!function_exists('konvo_anthropic_last_failure')) {
+    function konvo_anthropic_last_failure(?array $set = null): array
+    {
+        static $last = array('failed' => false, 'status' => 0, 'error' => '');
+        if ($set !== null) $last = $set;
+        return $last;
+    }
+}
+
+if (!function_exists('konvo_anthropic_unavailable')) {
+    function konvo_anthropic_unavailable(): bool
+    {
+        $f = konvo_anthropic_last_failure();
+        if (empty($f['failed'])) return false;
+        $status = (int)($f['status'] ?? 0);
+        // 0 covers network/curl failures; 4xx auth, disabled org and quota; 5xx outages.
+        if ($status === 0 || $status === 401 || $status === 403 || $status === 429 || $status >= 500) return true;
+        $err = strtolower((string)($f['error'] ?? ''));
+        foreach (array('disabled', 'credit', 'quota', 'billing', 'suspend', 'rate limit') as $needle) {
+            if (strpos($err, $needle) !== false) return true;
+        }
+        return false;
+    }
+}
+
 if (!function_exists('konvo_anthropic_map_model')) {
     function konvo_anthropic_map_model(string $model): string
     {
@@ -36,6 +66,7 @@ if (!function_exists('konvo_anthropic_chat_json')) {
     function konvo_anthropic_chat_json(array $payload, int $timeoutSeconds = 60): array
     {
         if (KONVO_ANTHROPIC_API_KEY === '') {
+            konvo_anthropic_last_failure(array('failed' => true, 'status' => 0, 'error' => 'ANTHROPIC_API_KEY missing.'));
             return array('ok' => false, 'error' => 'ANTHROPIC_API_KEY missing.');
         }
         if (!function_exists('curl_init')) {
@@ -107,6 +138,7 @@ if (!function_exists('konvo_anthropic_chat_json')) {
         curl_close($ch);
 
         if ($raw === false || $err !== '') {
+            konvo_anthropic_last_failure(array('failed' => true, 'status' => 0, 'error' => ($err !== '' ? $err : 'Anthropic request failed.')));
             return array('ok' => false, 'error' => ($err !== '' ? $err : 'Anthropic request failed.'), 'status' => $status);
         }
 
@@ -117,6 +149,7 @@ if (!function_exists('konvo_anthropic_chat_json')) {
 
         if ($status < 200 || $status >= 300) {
             $msg = isset($decoded['error']['message']) ? (string)$decoded['error']['message'] : ('Anthropic returned status ' . $status);
+            konvo_anthropic_last_failure(array('failed' => true, 'status' => $status, 'error' => $msg));
             return array('ok' => false, 'error' => $msg, 'body' => $decoded, 'status' => $status);
         }
 
@@ -150,6 +183,7 @@ if (!function_exists('konvo_anthropic_chat_json')) {
             'usage' => $decoded['usage'] ?? array(),
         );
 
+        konvo_anthropic_last_failure(array('failed' => false, 'status' => $status, 'error' => ''));
         return array('ok' => true, 'body' => $compatBody, 'status' => $status);
     }
 }
