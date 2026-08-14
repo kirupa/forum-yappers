@@ -647,6 +647,22 @@ function casual_text_is_english_like(string $text): bool
     return $latinCount >= max(8, $nonLatinCount * 2);
 }
 
+function casual_has_foreign_script(string $text): bool
+{
+    // The ratio test in casual_text_is_english_like() is for filtering seeds and
+    // tolerates a stray character. Generated bodies get zero tolerance: one
+    // foreign word dropped mid-sentence ("I'm not <arabic> shipping fast") is
+    // enough to make a post look broken, and it happens intermittently.
+    // Latin Extended is deliberately allowed so cafe/naive/resume survive, and
+    // emoji live in symbol ranges that are not matched here.
+    $stripped = preg_replace('/```[\s\S]*?```/', ' ', $text) ?? $text;
+    $stripped = preg_replace('/`[^`\n]*`/', ' ', $stripped) ?? $stripped;
+    return (bool)preg_match(
+        '/[\x{0400}-\x{04FF}\x{0590}-\x{05FF}\x{0600}-\x{06FF}\x{0900}-\x{097F}\x{0E00}-\x{0E7F}\x{3040}-\x{30FF}\x{4E00}-\x{9FFF}\x{AC00}-\x{D7AF}]/u',
+        $stripped
+    );
+}
+
 function casual_item_looks_shopping_deal(array $item): bool
 {
     $blob = trim(
@@ -1626,6 +1642,9 @@ function casual_validate_generated_topic(string $title, string $raw): array
     // is already a tech-news feed, so scope/technical/depth heuristics only rejected
     // good posts. Structural checks (length, no code block) still apply.
 
+    if (casual_has_foreign_script($title . "\n" . $raw)) {
+        return array('ok' => false, 'error' => 'non-English characters leaked into the post');
+    }
     if (strpos($raw, '```') !== false) {
         return array('ok' => false, 'error' => 'code block not expected for casual topic');
     }

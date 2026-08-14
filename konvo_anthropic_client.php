@@ -1,189 +1,172 @@
 <?php
 
+/*
+ * Shared LLM transport. Currently routed to OpenAI.
+ *
+ * The filename is historical: every worker already requires this file and calls
+ * konvo_anthropic_chat_json(), so the name is kept to avoid touching 30+ call
+ * sites. Treat it as "the LLM client".
+ *
+ * Call sites pass OpenAI chat-completions-shaped payloads (model, messages,
+ * temperature, max_tokens) and read choices[0].message.content, so this is
+ * mostly a passthrough. It is not a pure passthrough, because the gpt-5 family
+ * rejects payloads that older models accepted:
+ *
+ *   - max_tokens is refused outright; it must be max_completion_tokens.
+ *   - Some models refuse any temperature other than the default. Those same
+ *     models spend "reasoning tokens" out of the completion budget, so a small
+ *     budget returns an empty string with finish_reason=length rather than an
+ *     error. Silently posting that empty string would be the worst outcome, so
+ *     it is converted into a failure the callers' existing retry paths handle.
+ *
+ * Verified against the live API on 2026-08-11:
+ *   gpt-5.4, gpt-5.4-mini, gpt-5.4-nano, gpt-5.2  accept temperature, 0 reasoning tokens
+ *   gpt-5, gpt-5-mini, gpt-5-nano                 reject temperature, burn reasoning tokens
+ */
+
 declare(strict_types=1);
 
+if (!defined('KONVO_LLM_API_KEY')) {
+    define('KONVO_LLM_API_KEY', trim((string)getenv('OPENAI_API_KEY')));
+}
+// Back-compat: workers guard on this constant before running.
 if (!defined('KONVO_ANTHROPIC_API_KEY')) {
-    define('KONVO_ANTHROPIC_API_KEY', trim((string)getenv('ANTHROPIC_API_KEY')));
+    define('KONVO_ANTHROPIC_API_KEY', KONVO_LLM_API_KEY);
+}
+if (!defined('KONVO_LLM_ENDPOINT')) {
+    define('KONVO_LLM_ENDPOINT', 'https://api.openai.com/v1/chat/completions');
 }
 
-/**
- * Records the outcome of the most recent API call so workers can tell an
- * unavailable API apart from a merely unusable answer, and skip posting rather
- * than falling back to canned content.
- */
-if (!function_exists('konvo_anthropic_last_failure')) {
-    function konvo_anthropic_last_failure(?array $set = null): array
-    {
-        static $last = array('failed' => false, 'status' => 0, 'error' => '');
-        if ($set !== null) $last = $set;
-        return $last;
-    }
-}
-
-if (!function_exists('konvo_anthropic_unavailable')) {
-    function konvo_anthropic_unavailable(): bool
-    {
-        $f = konvo_anthropic_last_failure();
-        if (empty($f['failed'])) return false;
-        $status = (int)($f['status'] ?? 0);
-        // 0 covers network/curl failures; 4xx auth, disabled org and quota; 5xx outages.
-        if ($status === 0 || $status === 401 || $status === 403 || $status === 429 || $status >= 500) return true;
-        $err = strtolower((string)($f['error'] ?? ''));
-        foreach (array('disabled', 'credit', 'quota', 'billing', 'suspend', 'rate limit') as $needle) {
-            if (strpos($err, $needle) !== false) return true;
-        }
-        return false;
-    }
-}
-
-if (!function_exists('konvo_anthropic_map_model')) {
-    function konvo_anthropic_map_model(string $model): string
+if (!function_exists('konvo_llm_map_model')) {
+    function konvo_llm_map_model(string $model): string
     {
         $m = trim($model);
+        // Anything left over from the Claude period maps onto the equivalent tier.
         switch ($m) {
-            case 'gpt-5.4-mini':
-                return 'claude-haiku-4-5';
-            case 'gpt-5.2':
-                return 'claude-sonnet-5';
-            case 'gpt-5.4':
-                return 'claude-opus-5';
+            case 'claude-haiku-4-5':  return 'gpt-5.4-nano';
+            case 'claude-sonnet-5':   return 'gpt-5.4-mini';
+            case 'claude-opus-5':
+            case 'claude-fable-5':    return 'gpt-5.4';
         }
-        if (strpos($m, 'claude-') === 0) {
-            return $m;
-        }
-        return 'claude-sonnet-5';
+        if ($m === '') return 'gpt-5.4-mini';
+        return $m;
     }
 }
 
 /**
- * Accepts an OpenAI chat-completions-shaped payload (model, messages,
- * optional temperature/max_tokens/max_completion_tokens), calls Anthropic's
- * Messages API, and returns an OpenAI-chat-completions-shaped result so
- * every existing call site (`$res['body']['choices'][0]['message']['content']`)
- * keeps working unchanged.
+ * Models that refuse a non-default temperature. These are also the ones that
+ * consume completion budget on hidden reasoning tokens.
  */
-if (!function_exists('konvo_anthropic_chat_json')) {
-    function konvo_anthropic_chat_json(array $payload, int $timeoutSeconds = 60): array
+if (!function_exists('konvo_llm_is_strict_model')) {
+    function konvo_llm_is_strict_model(string $model): bool
     {
-        if (KONVO_ANTHROPIC_API_KEY === '') {
-            konvo_anthropic_last_failure(array('failed' => true, 'status' => 0, 'error' => 'ANTHROPIC_API_KEY missing.'));
-            return array('ok' => false, 'error' => 'ANTHROPIC_API_KEY missing.');
+        $m = strtolower(trim($model));
+        if (preg_match('/^(o1|o3|o4)\b/', $m)) return true;
+        // gpt-5, gpt-5-mini, gpt-5-nano and dated variants of those, but NOT
+        // gpt-5.1 / 5.2 / 5.4 / 5.5, which behave like normal chat models.
+        return (bool)preg_match('/^gpt-5(?:-(?:mini|nano|chat-latest))?(?:-\d{4}-\d{2}-\d{2})?$/', $m);
+    }
+}
+
+if (!function_exists('konvo_llm_chat_json')) {
+    function konvo_llm_chat_json(array $payload, int $timeoutSeconds = 60): array
+    {
+        if (KONVO_LLM_API_KEY === '') {
+            return array('ok' => false, 'error' => 'OPENAI_API_KEY missing.');
         }
         if (!function_exists('curl_init')) {
             return array('ok' => false, 'error' => 'curl_init unavailable.');
         }
 
-        $model = konvo_anthropic_map_model((string)($payload['model'] ?? ''));
+        $model = konvo_llm_map_model((string)($payload['model'] ?? ''));
+        $strict = konvo_llm_is_strict_model($model);
 
-        $system = '';
         $messages = array();
         foreach ((array)($payload['messages'] ?? array()) as $m) {
-            if (!is_array($m)) {
-                continue;
-            }
+            if (!is_array($m)) continue;
             $role = (string)($m['role'] ?? '');
-            $content = (string)($m['content'] ?? '');
-            if ($role === 'system') {
-                $system = ($system !== '' ? $system . "\n\n" : '') . $content;
-                continue;
-            }
-            if ($role !== 'user' && $role !== 'assistant') {
-                continue;
-            }
-            $messages[] = array('role' => $role, 'content' => $content);
+            if (!in_array($role, array('system', 'user', 'assistant'), true)) continue;
+            $messages[] = array('role' => $role, 'content' => (string)($m['content'] ?? ''));
         }
-        if (empty($messages)) {
-            return array('ok' => false, 'error' => 'No user/assistant messages to send.');
+        if ($messages === array()) {
+            return array('ok' => false, 'error' => 'No messages to send.');
         }
 
-        // Default generously: several workers omit max_tokens, and a truncated reply
-        // surfaces downstream as "model returned non-JSON content" rather than as an
-        // obvious length error.
-        $maxTokens = (int)($payload['max_tokens'] ?? ($payload['max_completion_tokens'] ?? 2048));
-        if ($maxTokens < 1) {
-            $maxTokens = 2048;
-        }
+        $budget = (int)($payload['max_completion_tokens'] ?? ($payload['max_tokens'] ?? 2048));
+        if ($budget < 1) $budget = 2048;
+        // Reasoning models spend the budget before writing anything, so give
+        // them room or the reply comes back empty.
+        if ($strict) $budget = max($budget + 512, 1024);
 
-        $anthropicPayload = array(
+        $body = array(
             'model' => $model,
-            'max_tokens' => $maxTokens,
             'messages' => $messages,
+            'max_completion_tokens' => $budget,
         );
-        if ($system !== '') {
-            $anthropicPayload['system'] = $system;
+        if (!$strict && isset($payload['temperature'])) {
+            $body['temperature'] = (float)$payload['temperature'];
         }
-        // Opus 5 and Sonnet 5 think adaptively by default; disable it for
-        // these short, deterministic-style completions so max_tokens isn't
-        // consumed by reasoning instead of the reply text. Haiku doesn't
-        // think unless asked, so leave it alone.
-        if ($model === 'claude-opus-5' || $model === 'claude-sonnet-5') {
-            $anthropicPayload['thinking'] = array('type' => 'disabled');
+        foreach (array('response_format', 'top_p', 'presence_penalty', 'frequency_penalty') as $k) {
+            if (!$strict && isset($payload[$k])) $body[$k] = $payload[$k];
         }
 
-        $ch = curl_init('https://api.anthropic.com/v1/messages');
+        $ch = curl_init(KONVO_LLM_ENDPOINT);
         curl_setopt_array($ch, array(
             CURLOPT_POST => true,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $timeoutSeconds,
+            CURLOPT_CONNECTTIMEOUT => 12,
             CURLOPT_HTTPHEADER => array(
                 'Content-Type: application/json',
-                'x-api-key: ' . KONVO_ANTHROPIC_API_KEY,
-                'anthropic-version: 2023-06-01',
+                'Authorization: Bearer ' . KONVO_LLM_API_KEY,
             ),
-            CURLOPT_POSTFIELDS => json_encode($anthropicPayload, JSON_UNESCAPED_SLASHES),
+            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_SLASHES),
         ));
         $raw = curl_exec($ch);
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $err = curl_error($ch);
-        curl_close($ch);
 
         if ($raw === false || $err !== '') {
-            konvo_anthropic_last_failure(array('failed' => true, 'status' => 0, 'error' => ($err !== '' ? $err : 'Anthropic request failed.')));
-            return array('ok' => false, 'error' => ($err !== '' ? $err : 'Anthropic request failed.'), 'status' => $status);
+            return array('ok' => false, 'error' => ($err !== '' ? $err : 'LLM request failed.'), 'status' => $status);
         }
 
         $decoded = json_decode((string)$raw, true);
         if (!is_array($decoded)) {
-            return array('ok' => false, 'error' => 'Anthropic JSON decode failed.', 'raw' => (string)$raw, 'status' => $status);
+            return array('ok' => false, 'error' => 'LLM JSON decode failed.', 'raw' => substr((string)$raw, 0, 300), 'status' => $status);
         }
-
         if ($status < 200 || $status >= 300) {
-            $msg = isset($decoded['error']['message']) ? (string)$decoded['error']['message'] : ('Anthropic returned status ' . $status);
-            konvo_anthropic_last_failure(array('failed' => true, 'status' => $status, 'error' => $msg));
+            $msg = isset($decoded['error']['message']) ? (string)$decoded['error']['message'] : ('LLM returned status ' . $status);
             return array('ok' => false, 'error' => $msg, 'body' => $decoded, 'status' => $status);
         }
 
-        if (($decoded['stop_reason'] ?? '') === 'refusal') {
-            return array('ok' => false, 'error' => 'Anthropic declined the request (refusal).', 'body' => $decoded, 'status' => $status);
+        $text = (string)($decoded['choices'][0]['message']['content'] ?? '');
+        $finish = (string)($decoded['choices'][0]['finish_reason'] ?? '');
+        if (trim($text) === '') {
+            // Empty because the budget was spent on reasoning, or a refusal.
+            // Report it as a failure so the caller retries instead of posting
+            // an empty body.
+            return array(
+                'ok' => false,
+                'error' => 'LLM returned empty content (finish_reason=' . ($finish !== '' ? $finish : 'unknown') . ').',
+                'status' => $status,
+                'body' => $decoded,
+            );
         }
 
-        $text = '';
-        foreach ((array)($decoded['content'] ?? array()) as $block) {
-            if (is_array($block) && ($block['type'] ?? '') === 'text') {
-                $text .= (string)($block['text'] ?? '');
-            }
-        }
+        return array('ok' => true, 'body' => $decoded, 'status' => $status);
+    }
+}
 
-        // Claude wraps JSON answers in a ```json fence where OpenAI returned them bare.
-        // Unwrap only when the whole reply is one fenced block that parses as JSON, so a
-        // forum post that legitimately contains a code block is never touched.
-        $trimmed = trim($text);
-        if (preg_match('/\A```[a-zA-Z0-9_-]*\s*\n(.*)\n?```\z/s', $trimmed, $m)) {
-            $inner = trim((string)$m[1]);
-            if ($inner !== '' && is_array(json_decode($inner, true))) {
-                $text = $inner;
-            }
-        }
-
-        $compatBody = array(
-            'choices' => array(
-                array('message' => array('role' => 'assistant', 'content' => $text)),
-            ),
-            'model' => $model,
-            'usage' => $decoded['usage'] ?? array(),
-        );
-
-        konvo_anthropic_last_failure(array('failed' => false, 'status' => $status, 'error' => ''));
-        return array('ok' => true, 'body' => $compatBody, 'status' => $status);
+// Every worker calls this name.
+if (!function_exists('konvo_anthropic_chat_json')) {
+    function konvo_anthropic_chat_json(array $payload, int $timeoutSeconds = 60): array
+    {
+        return konvo_llm_chat_json($payload, $timeoutSeconds);
+    }
+}
+if (!function_exists('konvo_anthropic_map_model')) {
+    function konvo_anthropic_map_model(string $model): string
+    {
+        return konvo_llm_map_model($model);
     }
 }
