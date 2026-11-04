@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/kirupa_article_helper.php';
 require_once __DIR__ . '/konvo_link_helper.php';
 require_once __DIR__ . '/konvo_anthropic_client.php';
+require_once __DIR__ . '/konvo_reply_claim_helper.php';
 require_once __DIR__ . '/konvo_code_format_helper.php';
 
 $konvoModelRouter = __DIR__ . '/konvo_model_router.php';
@@ -8115,12 +8116,14 @@ function konvo_run_reply(array $cfg): void
 
     $baseUrl = trim((string)(getenv('DISCOURSE_BASE_URL') ?: 'https://forum.kirupa.com'));
     $discourseApiKey = trim((string)getenv('DISCOURSE_API_KEY'));
-    $anthropicApiKey = trim((string)getenv('ANTHROPIC_API_KEY'));
+    // The LLM key comes from the shared client (GEMINI_API_KEY today), not
+    // from whichever provider env var this file was written against.
+    $anthropicApiKey = KONVO_ANTHROPIC_API_KEY;
     if ($discourseApiKey === '') {
         konvo_json_out(['ok' => false, 'error' => 'DISCOURSE_API_KEY is not configured on the server.'], 500);
     }
     if ($anthropicApiKey === '') {
-        konvo_json_out(['ok' => false, 'error' => 'ANTHROPIC_API_KEY is not configured on the server.'], 500);
+        konvo_json_out(['ok' => false, 'error' => 'LLM API key (GEMINI_API_KEY) is not configured on the server.'], 500);
     }
 
     $botUsername = (string)$cfg['bot_username'];
@@ -8191,6 +8194,30 @@ function konvo_run_reply(array $cfg): void
     $topicOpLower = strtolower($topicOpUsername);
     $botLower = strtolower(trim($botUsername));
 
+    // One reply per bot per target post, and one bot per human post in
+    // challenge threads. Covers webhook retries after a client timeout, the
+    // safe_mode follow-up, and the cron quiz acknowledgement racing this run.
+    $claimTopicId = $topicId;
+    $claimPostNumber = $lastPostNumber;
+    $claimWho = konvo_is_challenge_topic_title($title) ? '*' : $botLower;
+    if ($claimPostNumber > 0 && !$manualEditMode && !$previewOnly) {
+        $alreadyReplied = konvo_posts_have_bot_reply_to($posts, $claimPostNumber, $botUsername, 'konvo_is_known_bot_username')
+            || ($claimWho === '*' && konvo_posts_have_bot_reply_to($posts, $claimPostNumber, '', 'konvo_is_known_bot_username'));
+        if ($alreadyReplied || !konvo_reply_claim($claimTopicId, $claimPostNumber, $claimWho)) {
+            konvo_json_out([
+                'ok' => true,
+                'posted' => false,
+                'ignored' => true,
+                'reason' => $alreadyReplied ? 'already_replied_to_target' : 'reply_in_progress_for_target',
+                'target_post_number' => $claimPostNumber,
+                'target_username' => $lastUsername,
+            ]);
+        }
+        register_shutdown_function(static function () use ($claimTopicId, $claimPostNumber, $claimWho): void {
+            konvo_reply_claim_release($claimTopicId, $claimPostNumber, $claimWho);
+        });
+    }
+
     if ($safeMode && !$manualEditMode) {
         $safeModel = konvo_model_for_task('reply_text', ['technical' => false, 'safe_mode' => true]);
         $safeSoulPrompt = konvo_compose_forum_persona_system_prompt(
@@ -8221,6 +8248,16 @@ function konvo_run_reply(array $cfg): void
                 ));
             }
             $safeReplyText = konvo_emergency_safe_reply_text($title, $lastRaw, $topicOpRaw);
+            // The canned lines are deterministic, so a second bot (or a retry)
+            // would post the exact same words. Never repeat one in a thread.
+            if (konvo_posts_contain_text($posts, $safeReplyText)) {
+                konvo_json_out([
+                    'ok' => true,
+                    'posted' => false,
+                    'reason' => 'canned_reply_already_in_thread',
+                    'target_post_number' => $lastPostNumber,
+                ]);
+            }
         }
         if ($previewOnly) {
             konvo_json_out([
@@ -8260,6 +8297,7 @@ function konvo_run_reply(array $cfg): void
         $newPost = $postRes['body'];
         $newPostId = (int)($newPost['id'] ?? 0);
         $newPostNumber = (int)($newPost['post_number'] ?? 0);
+        konvo_reply_claim_mark_posted($claimTopicId, $claimPostNumber, $claimWho);
         $postUrl = $baseUrl . '/t/' . $topicId . '/' . $newPostNumber;
         konvo_update_persona_facts_after_reply($botUsername, $safeReplyText);
         konvo_json_out([
@@ -10677,6 +10715,7 @@ function konvo_run_reply(array $cfg): void
         }
         konvo_json_out(['ok' => false, 'error' => $err], 502);
     }
+    konvo_reply_claim_mark_posted($claimTopicId, $claimPostNumber, $claimWho);
     konvo_question_cadence_record_post($botUsername);
 
     $freshTopicRes = konvo_call_api($baseUrl . '/t/' . $topicId . '.json', $commonHeaders);

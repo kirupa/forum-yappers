@@ -442,7 +442,7 @@ $allowedPostBots = [
     'arthurdent' => 'ArthurDent',
     'hariseldon' => 'HariSeldon',
 ];
-$anthropicApiKey = trim((string)getenv('ANTHROPIC_API_KEY'));
+$anthropicApiKey = KONVO_ANTHROPIC_API_KEY;
 
 $errors = [];
 $successUrl = '';

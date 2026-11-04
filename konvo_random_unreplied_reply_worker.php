@@ -17,6 +17,7 @@ require_once __DIR__ . '/konvo_signature_helper.php';
 require_once __DIR__ . '/kirupa_article_helper.php';
 require_once __DIR__ . '/konvo_link_helper.php';
 require_once __DIR__ . '/konvo_anthropic_client.php';
+require_once __DIR__ . '/konvo_reply_claim_helper.php';
 require_once __DIR__ . '/konvo_code_format_helper.php';
 $konvoForumPromptHelper = __DIR__ . '/konvo_forum_prompt_helper.php';
 if (is_file($konvoForumPromptHelper)) {
@@ -116,20 +117,24 @@ function save_seen_topics($state)
 // This keeps only one real (non-dry-run) invocation of this worker executing at a time.
 function worker_acquire_run_lock()
 {
+    // Must outlive this function: a local handle is freed on return, which
+    // releases the flock immediately and lets overlapping runs through.
+    static $handle = null;
+    if ($handle !== null) return true;
     $dir = __DIR__ . '/.konvo_state';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
     $path = $dir . '/random_unreplied_reply_worker.lock';
-    $handle = @fopen($path, 'c');
-    if ($handle === false) {
+    $fh = @fopen($path, 'c');
+    if ($fh === false) {
         // If we can't even open a lock file, fail open rather than blocking all replies forever.
         return true;
     }
-    if (!flock($handle, LOCK_EX | LOCK_NB)) {
-        fclose($handle);
+    if (!flock($fh, LOCK_EX | LOCK_NB)) {
+        fclose($fh);
         return false;
     }
-    // Intentionally leaked for the life of the request: PHP releases the flock
-    // automatically when the script exits or the handle is garbage collected.
+    // PHP releases the flock automatically when the script exits.
+    $handle = $fh;
     return true;
 }
 
@@ -4216,6 +4221,26 @@ function worker_generate_and_post_quiz_ack($bots, array $target, bool $dryRun)
         );
     }
 
+    // Another path may have answered this guess while the reply was generating.
+    $recheck = fetch_json(rtrim(KONVO_BASE_URL, '/') . '/t/' . $topicId . '.json', array(
+        'Api-Key: ' . KONVO_DISCOURSE_API_KEY,
+        'Api-Username: BayMax',
+    ));
+    if (is_array($recheck) && isset($recheck['post_stream']['posts']) && is_array($recheck['post_stream']['posts'])) {
+        foreach ($recheck['post_stream']['posts'] as $rp) {
+            if (!is_array($rp)) continue;
+            if ((int)($rp['post_number'] ?? 0) > (int)$target['human_post_number'] && is_bot_user((string)($rp['username'] ?? ''))) {
+                return array(
+                    'ok' => true,
+                    'posted' => false,
+                    'reason' => 'Skipped: a bot already replied after this guess.',
+                    'topic_id' => $topicId,
+                    'raced_with_username' => (string)($rp['username'] ?? ''),
+                );
+            }
+        }
+    }
+
     $postRes = post_json(
         rtrim(KONVO_BASE_URL, '/') . '/posts.json',
         array(
@@ -4230,6 +4255,7 @@ function worker_generate_and_post_quiz_ack($bots, array $target, bool $dryRun)
     );
     return array(
         'ok' => (bool)($postRes['ok'] ?? false),
+        'posted' => (bool)($postRes['ok'] ?? false),
         'topic_id' => $topicId,
         'bot' => $bot,
         'answer_attempt' => $answerAttempt,
@@ -5597,9 +5623,24 @@ $seen = load_seen_topics();
 
 $quizAckTarget = worker_find_quiz_ack_target($latest['topic_list']['topics'], $seen, 20);
 if (is_array($quizAckTarget)) {
-    $ackResult = worker_generate_and_post_quiz_ack($bots, $quizAckTarget, $dryRun);
+    // Shares the claim with the webhook reply path, so a human guess gets one
+    // acknowledgement even when both paths see it as unanswered at once.
+    $ackTopicId = (int)$quizAckTarget['topic_id'];
+    $ackPostNumber = (int)$quizAckTarget['human_post_number'];
+    if (!$dryRun && !konvo_reply_claim($ackTopicId, $ackPostNumber, '*')) {
+        $ackResult = array('ok' => true, 'posted' => false, 'reason' => 'reply_in_progress_for_target', 'topic_id' => $ackTopicId);
+    } else {
+        $ackResult = worker_generate_and_post_quiz_ack($bots, $quizAckTarget, $dryRun);
+        if (!$dryRun) {
+            if (!empty($ackResult['ok']) && !empty($ackResult['posted'])) {
+                konvo_reply_claim_mark_posted($ackTopicId, $ackPostNumber, '*');
+            } else {
+                konvo_reply_claim_release($ackTopicId, $ackPostNumber, '*');
+            }
+        }
+    }
     if (!$dryRun) {
-        $seen['quizack:' . (int)$quizAckTarget['topic_id']] = time();
+        $seen['quizack:' . $ackTopicId] = time();
         save_seen_topics($seen);
     }
     out_json(200, array_merge(array('ok' => (bool)($ackResult['ok'] ?? false), 'action' => 'quiz_ack_reply'), $ackResult));
