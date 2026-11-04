@@ -75,8 +75,55 @@ if (!function_exists('konvo_llm_supports_thinking_budget')) {
     }
 }
 
+/**
+ * Records the outcome of the most recent API call so workers can tell an
+ * unavailable API apart from a merely unusable answer, and skip posting rather
+ * than falling back to canned content. Callers guard on these with
+ * function_exists(), so if they go missing the canned fallbacks silently
+ * come back. Keep them when swapping providers.
+ */
+if (!function_exists('konvo_anthropic_last_failure')) {
+    function konvo_anthropic_last_failure(?array $set = null): array
+    {
+        static $last = array('failed' => false, 'status' => 0, 'error' => '');
+        if ($set !== null) $last = $set;
+        return $last;
+    }
+}
+
+if (!function_exists('konvo_anthropic_unavailable')) {
+    function konvo_anthropic_unavailable(): bool
+    {
+        $f = konvo_anthropic_last_failure();
+        if (empty($f['failed'])) return false;
+        $status = (int)($f['status'] ?? 0);
+        // 0: network/curl failure or missing key. 401/403: auth or disabled
+        // project. 404: model retired. 429: quota. 5xx: outage.
+        if ($status === 0 || $status === 401 || $status === 403 || $status === 404 || $status === 429 || $status >= 500) return true;
+        $err = strtolower((string)($f['error'] ?? ''));
+        // Gemini reports a bad key as a 400 with "API key not valid".
+        foreach (array('api key', 'disabled', 'credit', 'quota', 'billing', 'suspend', 'rate limit', 'resource_exhausted', 'permission') as $needle) {
+            if (strpos($err, $needle) !== false) return true;
+        }
+        return false;
+    }
+}
+
 if (!function_exists('konvo_llm_chat_json')) {
     function konvo_llm_chat_json(array $payload, int $timeoutSeconds = 60): array
+    {
+        $res = konvo_llm_chat_json_once($payload, $timeoutSeconds);
+        konvo_anthropic_last_failure(array(
+            'failed' => empty($res['ok']),
+            'status' => (int)($res['status'] ?? 0),
+            'error' => empty($res['ok']) ? (string)($res['error'] ?? '') : '',
+        ));
+        return $res;
+    }
+}
+
+if (!function_exists('konvo_llm_chat_json_once')) {
+    function konvo_llm_chat_json_once(array $payload, int $timeoutSeconds = 60): array
     {
         if (KONVO_LLM_API_KEY === '') {
             return array('ok' => false, 'error' => 'GEMINI_API_KEY missing.');
@@ -107,7 +154,7 @@ if (!function_exists('konvo_llm_chat_json')) {
             );
         }
         if ($contents === array()) {
-            return array('ok' => false, 'error' => 'No user/assistant messages to send.');
+            return array('ok' => false, 'error' => 'No user/assistant messages to send.', 'status' => 400);
         }
 
         $budget = (int)($payload['max_tokens'] ?? ($payload['max_completion_tokens'] ?? 2048));

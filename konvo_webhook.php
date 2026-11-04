@@ -153,11 +153,15 @@ function postForm(string $url, array $fields): array
         CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
         CURLOPT_POSTFIELDS => http_build_query($fields),
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 30,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        // A reply run makes several sequential LLM calls, each allowed 60s.
+        // 30s here used to cut most runs off while they were still working.
+        CURLOPT_TIMEOUT => 150,
     ]);
     $body = curl_exec($ch);
     $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $error = curl_error($ch);
+    $errno = curl_errno($ch);
     curl_close($ch);
 
     $decoded = is_string($body) ? json_decode($body, true) : null;
@@ -165,6 +169,8 @@ function postForm(string $url, array $fields): array
         'ok' => $error === '' && $status >= 200 && $status < 300 && is_array($decoded) && !empty($decoded['ok']),
         'status' => $status,
         'error' => $error,
+        // The endpoint was reached and may still be running, so it may yet post.
+        'timed_out' => $errno === CURLE_OPERATION_TIMEDOUT,
         'raw' => is_string($body) ? $body : '',
         'body' => is_array($decoded) ? $decoded : null,
     ];
@@ -173,12 +179,17 @@ function postForm(string $url, array $fields): array
 function postFormWithRetry(string $url, array $fields, int $attempts = 3, int $delayMicros = 350000): array
 {
     $attempts = max(1, $attempts);
-    $last = ['ok' => false, 'status' => 0, 'error' => 'unattempted', 'raw' => '', 'body' => null, 'attempts' => 0];
+    $last = ['ok' => false, 'status' => 0, 'error' => 'unattempted', 'raw' => '', 'body' => null, 'attempts' => 0, 'timed_out' => false];
     for ($i = 1; $i <= $attempts; $i++) {
         $res = postForm($url, $fields);
         $res['attempts'] = $i;
         $last = $res;
         if (!empty($res['ok'])) {
+            return $res;
+        }
+        // Re-sending after a timeout is how one post collected duplicate
+        // replies: the first run was still generating and posted anyway.
+        if (!empty($res['timed_out'])) {
             return $res;
         }
         $status = (int)($res['status'] ?? 0);
@@ -473,7 +484,7 @@ if ($isTrackedBotAuthor && $author !== 'kirupabot') {
             'force_reply_to_bot' => '1',
             'force_kirupa_link' => '1',
         ]);
-        if (empty($res['ok'])) {
+        if (empty($res['ok']) && empty($res['timed_out'])) {
             $res = postFormWithRetry($url, [
                 'topic_id' => (string)$topicId,
                 'reply_target' => 'latest',
@@ -584,7 +595,7 @@ foreach ($toTrigger as $bot => $script) {
     }
     $res = postFormWithRetry($url, $fields);
     $usedSafeMode = false;
-    if (empty($res['ok'])) {
+    if (empty($res['ok']) && empty($res['timed_out'])) {
         $safeFields = $fields;
         $safeFields['safe_mode'] = '1';
         $res = postFormWithRetry($url, $safeFields, 2, 250000);

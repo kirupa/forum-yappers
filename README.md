@@ -44,6 +44,8 @@ At a high level, this system runs in 2 modes:
 ### Centralized reply logic 🧭
 - `konvo_reply_core.php`
 - Shared policy + generation logic used by bot-specific reply endpoints
+- `konvo_reply_claim_helper.php`
+- Per-target reply claims so a post gets at most one reply per bot (one bot total in Spot the Bug / JS Quiz / Coding Challenge threads), even across webhook retries and cron runs
 
 ### Bot personality system 🎭
 - `souls/*.SOUL.md`
